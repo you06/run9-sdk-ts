@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { once } from "node:events";
 import { describe, expect, it } from "vitest";
+import { WebSocketServer } from "ws";
 import { Run9Client, Run9Error, type CreateProjectRequest, type ExecListRequest, type UpdateBoxRequest } from "../src/index.js";
 
 const creds = { ak: "ak-1", sk: "sk-1" };
@@ -171,6 +172,47 @@ describe("Run9Client", () => {
       expect(result.reason).toBe("done");
       expect(result.idleDeadlineAt).toBe("2026-03-28T12:00:00.000Z");
     } finally {
+      await server.close();
+    }
+  });
+
+  it("rejects invalid background exec exit-code headers", async () => {
+    const server = await testServer((_req, res) => {
+      res.setHeader("X-Run9-Exit-Code", "12abc");
+      res.end("body");
+    });
+
+    try {
+      await expect(new Run9Client(server.url).pullBackgroundExecOutput(creds, "exec-1")).rejects.toThrow(
+        "invalid X-Run9-Exit-Code header: 12abc"
+      );
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("buffers exec attach frames sent before readEvent and decodes data bytes", async () => {
+    const server = await testServer((_req, res) => {
+      res.statusCode = 404;
+      res.end();
+    });
+    const wss = new WebSocketServer({ server: server.raw, path: "/attach" });
+    wss.on("connection", (ws) => {
+      ws.send(JSON.stringify({ type: "stdout", data: Buffer.from("hi").toString("base64") }));
+    });
+
+    try {
+      const socket = await new Run9Client(server.url).execAttachURL("/attach");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const event = await socket.readEvent();
+      expect(event.type).toBe("stdout");
+      expect(Buffer.from(event.data ?? new Uint8Array()).toString("utf8")).toBe("hi");
+      socket.close();
+    } finally {
+      for (const client of wss.clients) {
+        client.terminate();
+      }
+      wss.close();
       await server.close();
     }
   });

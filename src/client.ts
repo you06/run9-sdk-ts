@@ -86,35 +86,43 @@ export class Run9Error extends Error {
 }
 
 export class ExecAttachSocket {
-  constructor(private readonly socket: WebSocket) {}
+  private readonly queue: Array<{ event?: ExecStreamEvent; error?: Error }> = [];
+  private readonly readers: Array<{
+    resolve: (event: ExecStreamEvent) => void;
+    reject: (error: Error) => void;
+  }> = [];
+  private terminalError: Error | undefined;
+
+  constructor(private readonly socket: WebSocket) {
+    this.socket.on("message", (data) => {
+      try {
+        const raw = typeof data === "string" ? data : Buffer.concat(asBuffers(data)).toString("utf8");
+        this.push({ event: decodeExecStreamEvent(raw) });
+      } catch (error) {
+        this.push({ error: asError(error) });
+      }
+    });
+    this.socket.on("error", (error) => {
+      this.fail(error);
+    });
+    this.socket.on("close", () => {
+      this.fail(new Error("exec attach websocket closed"));
+    });
+  }
 
   readEvent(): Promise<ExecStreamEvent> {
+    const item = this.queue.shift();
+    if (item?.event) {
+      return Promise.resolve(item.event);
+    }
+    if (item?.error) {
+      return Promise.reject(item.error);
+    }
+    if (this.terminalError) {
+      return Promise.reject(this.terminalError);
+    }
     return new Promise((resolve, reject) => {
-      const onMessage = (data: WebSocket.RawData) => {
-        cleanup();
-        try {
-          const raw = typeof data === "string" ? data : Buffer.concat(asBuffers(data)).toString("utf8");
-          resolve(JSON.parse(raw) as ExecStreamEvent);
-        } catch (error) {
-          reject(error);
-        }
-      };
-      const onError = (error: Error) => {
-        cleanup();
-        reject(error);
-      };
-      const onClose = () => {
-        cleanup();
-        reject(new Error("exec attach websocket closed"));
-      };
-      const cleanup = () => {
-        this.socket.off("message", onMessage);
-        this.socket.off("error", onError);
-        this.socket.off("close", onClose);
-      };
-      this.socket.once("message", onMessage);
-      this.socket.once("error", onError);
-      this.socket.once("close", onClose);
+      this.readers.push({ resolve, reject });
     });
   }
 
@@ -136,6 +144,28 @@ export class ExecAttachSocket {
 
   close(): void {
     this.socket.close();
+  }
+
+  private push(item: { event?: ExecStreamEvent; error?: Error }): void {
+    const reader = this.readers.shift();
+    if (reader) {
+      if (item.event) {
+        reader.resolve(item.event);
+      } else {
+        reader.reject(item.error ?? new Error("exec attach websocket read failed"));
+      }
+      return;
+    }
+    this.queue.push(item);
+  }
+
+  private fail(error: Error): void {
+    if (!this.terminalError) {
+      this.terminalError = error;
+    }
+    while (this.readers.length > 0) {
+      this.readers.shift()?.reject(error);
+    }
   }
 }
 
@@ -409,7 +439,7 @@ export class Run9Client {
       body,
       nextCursor: response.headers.get("X-Run9-Next-Cursor")?.trim() ?? "",
       state: response.headers.get("X-Run9-Exec-State")?.trim() ?? "",
-      exitCode: rawExitCode ? Number.parseInt(rawExitCode, 10) : undefined,
+      exitCode: rawExitCode ? parseStrictInteger(rawExitCode, "X-Run9-Exit-Code") : undefined,
       reason: response.headers.get("X-Run9-Reason")?.trim() ?? "",
       idleDeadlineAt: response.headers.get("X-Run9-Idle-Deadline-At")?.trim() || undefined
     };
@@ -549,6 +579,7 @@ export class Run9Client {
     const httpURL = resolveHTTPURL(this.baseURL, attachURL);
     const wsURL = websocketURL(httpURL);
     const socket = new WebSocket(wsURL, { handshakeTimeout: 15_000 });
+    const attachSocket = new ExecAttachSocket(socket);
     await new Promise<void>((resolve, reject) => {
       let settled = false;
       const done = (callback: () => void) => {
@@ -583,7 +614,7 @@ export class Run9Client {
       socket.once("error", onError);
       socket.once("unexpected-response", onUnexpectedResponse);
     });
-    return new ExecAttachSocket(socket);
+    return attachSocket;
   }
 
   private async request<T>(method: string, path: string, creds: Credentials, options: RequestOptions = {}): Promise<T> {
@@ -713,6 +744,25 @@ async function readIncomingMessageText(response: IncomingMessage): Promise<strin
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
   return Buffer.concat(chunks).toString("utf8");
+}
+
+function decodeExecStreamEvent(raw: string): ExecStreamEvent {
+  const event = JSON.parse(raw) as ExecStreamEvent;
+  if (typeof event.data === "string") {
+    event.data = new Uint8Array(Buffer.from(event.data, "base64"));
+  }
+  return event;
+}
+
+function parseStrictInteger(value: string, headerName: string): number {
+  if (!/^-?\d+$/.test(value)) {
+    throw new Error(`invalid ${headerName} header: ${value}`);
+  }
+  return Number.parseInt(value, 10);
+}
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
 }
 
 function encodePath(value: string): string {

@@ -457,7 +457,7 @@ export interface ExecBoxRequest {
 export interface ExecStreamEvent {
   type: string;
   exec_id?: string;
-  data?: string | Uint8Array;
+  data?: Uint8Array;
   exit_code?: number;
   failure_reason?: string;
   cancel_reason?: string;
