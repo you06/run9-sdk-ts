@@ -177,6 +177,42 @@ describe("Run9Client", () => {
     }
   });
 
+  it("reads foreground exec stream events after redirects", async () => {
+    const seen: string[] = [];
+    const server = await testServer((req, res) => {
+      seen.push(`${req.method ?? ""} ${req.url ?? ""} ${req.headers.accept ?? ""}`);
+      if (req.url === "/projects/default/workspace/boxes/box-1/execs/stream") {
+        res.statusCode = 303;
+        res.setHeader("Location", "/redirected-exec-stream");
+        res.end();
+        return;
+      }
+      expect(req.url).toBe("/redirected-exec-stream");
+      expect(req.headers.accept).toBe("application/x-ndjson");
+      res.setHeader("X-Run9-Exec-ID", "exec-redirected");
+      res.end(
+        `${JSON.stringify({ type: "stdout", data: Buffer.from("hi").toString("base64") })}\n${JSON.stringify({ type: "exit", exit_code: 0 })}\n`
+      );
+    });
+
+    try {
+      const stream = await new Run9Client(server.url, creds).withProject("default").startExecStream("box-1", { command: ["echo", "hi"] });
+      expect(stream.execID).toBe("exec-redirected");
+      const stdout = await stream.readEvent();
+      expect(stdout.type).toBe("stdout");
+      expect(Buffer.from(stdout.data ?? new Uint8Array()).toString("utf8")).toBe("hi");
+      const exit = await stream.readEvent();
+      expect(exit).toMatchObject({ type: "exit", exit_code: 0 });
+      expect(seen).toEqual([
+        "POST /projects/default/workspace/boxes/box-1/execs/stream application/x-ndjson",
+        "GET /redirected-exec-stream application/x-ndjson"
+      ]);
+      await stream.close();
+    } finally {
+      await server.close();
+    }
+  });
+
   it("reads background exec output body and headers", async () => {
     const server = await testServer(async (req, res) => {
       expect(req.url).toBe("/projects/default/workspace/execs/exec-1/pull-output");
