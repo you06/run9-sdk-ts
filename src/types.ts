@@ -168,6 +168,12 @@ export interface UpdateProjectSecretRequest {
   inject_header_name?: string;
 }
 
+export interface ListBoxesRequest {
+  creator?: string;
+  label?: string;
+  state?: BoxState;
+}
+
 export interface BoxView {
   box_id: string;
   org_id: string;
@@ -387,6 +393,10 @@ export interface ImportSnapRequest {
   image_ref: string;
 }
 
+export interface ListSnapsRequest {
+  attached?: boolean;
+}
+
 export interface UpdateMeRequest {
   display_name?: string;
 }
@@ -443,7 +453,7 @@ export interface CreateSnapFromSharedSnapRequest {
   version?: number;
 }
 
-export interface ExecBoxRequest {
+export interface ExecRequest {
   deadline_at?: string;
   command: string[];
   env_overrides?: Record<string, string>;
@@ -470,7 +480,7 @@ export interface ExecAttachInput {
   cols?: number;
 }
 
-export interface ExecListRequest {
+export interface ListExecsRequest {
   boxID?: string;
   state?: string;
   creator?: string;
@@ -482,9 +492,19 @@ export interface ExecListRequest {
   cursor?: string;
 }
 
-export interface ExecListResult {
+export interface ListExecsResult {
   execs: ExecView[];
   nextCursor: string;
+}
+
+export interface PullBackgroundExecOutputRequest {
+  cursor?: string;
+  wait?: number;
+}
+
+export interface WriteBackgroundExecStdinRequest {
+  data: BodyInit;
+  closeStdin?: boolean;
 }
 
 export interface BackgroundExecPullOutput {
@@ -494,9 +514,4 @@ export interface BackgroundExecPullOutput {
   exitCode?: number;
   reason: string;
   idleDeadlineAt?: string;
-}
-
-export interface ExecStreamResult {
-  execID: string;
-  body: ReadableStream<Uint8Array>;
 }

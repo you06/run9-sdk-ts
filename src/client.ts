@@ -8,6 +8,7 @@ import type {
   CreateBoxFromSharedSnapRequest,
   CreateBoxRequest,
   CreateInvitationRequest,
+  ImportSnapRequest,
   CreateProjectRequest,
   CreateProjectSecretRequest,
   CreateSSHKeyRequest,
@@ -19,13 +20,14 @@ import type {
   DeleteOrgResult,
   DeleteProjectResult,
   ExecAttachInput,
-  ExecBoxRequest,
-  ExecListRequest,
-  ExecListResult,
+  ExecRequest,
   ExecStreamEvent,
-  ExecStreamResult,
   ExecView,
   InvitationView,
+  ListBoxesRequest,
+  ListExecsRequest,
+  ListExecsResult,
+  ListSnapsRequest,
   MeView,
   MembershipView,
   OrgHostsView,
@@ -33,6 +35,7 @@ import type {
   ProjectMembershipView,
   ProjectSecretView,
   ProjectView,
+  PullBackgroundExecOutputRequest,
   PublishSharedSnapRequest,
   RuntimeRequestView,
   SharedSnapDetailView,
@@ -47,21 +50,12 @@ import type {
   UpdateOrgRequest,
   UpdateProjectMembershipRequest,
   UpdateProjectRequest,
-  UpdateProjectSecretRequest
+  UpdateProjectSecretRequest,
+  WriteBackgroundExecStdinRequest
 } from "./types.js";
 
 export interface Run9ClientOptions {
   fetch?: typeof fetch;
-}
-
-export interface BoxesFilters {
-  creator?: string;
-  label?: string;
-  state?: string;
-}
-
-export interface SnapsFilters {
-  attached?: string;
 }
 
 interface RequestOptions {
@@ -169,13 +163,65 @@ export class ExecAttachSocket {
   }
 }
 
+export class ExecStream {
+  readonly execID: string;
+  private readonly reader: ReadableStreamDefaultReader<Uint8Array>;
+  private readonly decoder = new TextDecoder();
+  private buffered = "";
+  private closed = false;
+
+  constructor(execID: string, body: ReadableStream<Uint8Array>) {
+    this.execID = execID;
+    this.reader = body.getReader();
+  }
+
+  async readEvent(): Promise<ExecStreamEvent> {
+    while (true) {
+      const line = this.shiftLine();
+      if (line !== undefined) {
+        return decodeExecStreamEvent(line);
+      }
+      const { done, value } = await this.reader.read();
+      if (done) {
+        const tail = this.buffered.trim();
+        this.buffered = "";
+        if (tail) {
+          return decodeExecStreamEvent(tail);
+        }
+        throw new Error("exec stream closed");
+      }
+      this.buffered += this.decoder.decode(value, { stream: true });
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    await this.reader.cancel();
+  }
+
+  private shiftLine(): string | undefined {
+    const index = this.buffered.indexOf("\n");
+    if (index < 0) {
+      return undefined;
+    }
+    const line = this.buffered.slice(0, index).trim();
+    this.buffered = this.buffered.slice(index + 1);
+    return line || this.shiftLine();
+  }
+}
+
 export class Run9Client {
   private readonly baseURL: string;
+  private readonly creds: Credentials;
   private readonly projectCID: string;
   private readonly fetchImpl: typeof fetch;
 
-  constructor(endpoint: string, options: Run9ClientOptions = {}) {
-    this.baseURL = endpoint.trim().replace(/\/+$/, "");
+  constructor(endpoint: string, creds: Credentials, options: Run9ClientOptions = {}) {
+    this.baseURL = normalizeEndpoint(endpoint);
+    this.creds = normalizeCredentials(creds);
     this.projectCID = "";
     this.fetchImpl = options.fetch ?? fetch;
   }
@@ -190,189 +236,177 @@ export class Run9Client {
     return this.clone(projectCID);
   }
 
-  whoAmI(creds: Credentials, options: { signal?: AbortSignal } = {}): Promise<CurrentOrgIdentityView> {
-    return this.request("GET", "/whoami", creds, { signal: options.signal });
+  whoAmI(options: { signal?: AbortSignal } = {}): Promise<CurrentOrgIdentityView> {
+    return this.request("GET", "/whoami", { signal: options.signal });
   }
 
-  updateAccount(creds: Credentials, req: UpdateMeRequest, options: { signal?: AbortSignal } = {}): Promise<MeView> {
-    return this.request("PATCH", "/account", creds, { body: req, signal: options.signal });
+  updateAccount(req: UpdateMeRequest, options: { signal?: AbortSignal } = {}): Promise<MeView> {
+    return this.request("PATCH", "/account", { body: req, signal: options.signal });
   }
 
-  sshKeys(creds: Credentials, options: { signal?: AbortSignal } = {}): Promise<SSHKeyView[]> {
-    return this.request("GET", "/account/ssh-keys", creds, { signal: options.signal });
+  listSSHKeys(options: { signal?: AbortSignal } = {}): Promise<SSHKeyView[]> {
+    return this.request("GET", "/account/ssh-keys", { signal: options.signal });
   }
 
-  createSSHKey(creds: Credentials, req: CreateSSHKeyRequest, options: { signal?: AbortSignal } = {}): Promise<SSHKeyView> {
-    return this.request("POST", "/account/ssh-keys", creds, { body: req, signal: options.signal });
+  createSSHKey(req: CreateSSHKeyRequest, options: { signal?: AbortSignal } = {}): Promise<SSHKeyView> {
+    return this.request("POST", "/account/ssh-keys", { body: req, signal: options.signal });
   }
 
-  deleteSSHKey(creds: Credentials, sshKeyID: string, options: { signal?: AbortSignal } = {}): Promise<SSHKeyView> {
-    return this.request("DELETE", `/account/ssh-keys/${encodePath(sshKeyID)}`, creds, { signal: options.signal });
+  deleteSSHKey(sshKeyID: string, options: { signal?: AbortSignal } = {}): Promise<SSHKeyView> {
+    return this.request("DELETE", `/account/ssh-keys/${encodePath(sshKeyID)}`, { signal: options.signal });
   }
 
-  projects(creds: Credentials, options: { signal?: AbortSignal } = {}): Promise<ProjectView[]> {
-    return this.request("GET", "/projects", creds, { signal: options.signal });
+  listProjects(options: { signal?: AbortSignal } = {}): Promise<ProjectView[]> {
+    return this.request("GET", "/projects", { signal: options.signal });
   }
 
-  createProject(creds: Credentials, req: CreateProjectRequest, options: { signal?: AbortSignal } = {}): Promise<ProjectView> {
-    return this.request("POST", "/projects", creds, { body: req, signal: options.signal });
+  createProject(req: CreateProjectRequest, options: { signal?: AbortSignal } = {}): Promise<ProjectView> {
+    return this.request("POST", "/projects", { body: req, signal: options.signal });
   }
 
-  projectByCID(creds: Credentials, projectCID: string, options: { signal?: AbortSignal } = {}): Promise<ProjectView> {
-    return this.request("GET", `/projects/${encodePath(projectCID)}`, creds, { signal: options.signal });
+  getProject(projectCID: string, options: { signal?: AbortSignal } = {}): Promise<ProjectView> {
+    return this.request("GET", `/projects/${encodePath(projectCID)}`, { signal: options.signal });
   }
 
-  updateProject(creds: Credentials, projectCID: string, req: UpdateProjectRequest, options: { signal?: AbortSignal } = {}): Promise<ProjectView> {
-    return this.request("PATCH", projectPath(projectCID), creds, { body: req, signal: options.signal });
+  updateProject(req: UpdateProjectRequest, options: { signal?: AbortSignal } = {}): Promise<ProjectView> {
+    return this.request("PATCH", projectPath(this.projectCID), { body: req, signal: options.signal });
   }
 
-  deleteProject(creds: Credentials, projectCID: string, options: { signal?: AbortSignal } = {}): Promise<DeleteProjectResult> {
-    return this.request("DELETE", projectPath(projectCID), creds, { signal: options.signal });
+  deleteProject(options: { signal?: AbortSignal } = {}): Promise<DeleteProjectResult> {
+    return this.request("DELETE", projectPath(this.projectCID), { signal: options.signal });
   }
 
-  projectMembers(creds: Credentials, projectCID: string, options: { signal?: AbortSignal } = {}): Promise<ProjectMembershipView[]> {
-    return this.request("GET", projectPath(projectCID, "/members"), creds, { signal: options.signal });
+  listProjectMembers(options: { signal?: AbortSignal } = {}): Promise<ProjectMembershipView[]> {
+    return this.request("GET", projectPath(this.projectCID, "/members"), { signal: options.signal });
   }
 
-  updateProjectMember(
-    creds: Credentials,
-    projectCID: string,
-    userID: string,
-    req: UpdateProjectMembershipRequest,
-    options: { signal?: AbortSignal } = {}
-  ): Promise<ProjectMembershipView> {
-    return this.request("PATCH", projectPath(projectCID, `/members/${encodePath(userID)}`), creds, { body: req, signal: options.signal });
+  updateProjectMember(userID: string, req: UpdateProjectMembershipRequest, options: { signal?: AbortSignal } = {}): Promise<ProjectMembershipView> {
+    return this.request("PATCH", projectPath(this.projectCID, `/members/${encodePath(userID)}`), { body: req, signal: options.signal });
   }
 
-  removeProjectMember(creds: Credentials, projectCID: string, userID: string, options: { signal?: AbortSignal } = {}): Promise<void> {
-    return this.requestVoid("DELETE", projectPath(projectCID, `/members/${encodePath(userID)}`), creds, { signal: options.signal });
+  deleteProjectMember(userID: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+    return this.requestVoid("DELETE", projectPath(this.projectCID, `/members/${encodePath(userID)}`), { signal: options.signal });
   }
 
-  updateOrg(creds: Credentials, orgID: string, req: UpdateOrgRequest, options: { signal?: AbortSignal } = {}): Promise<OrgView> {
-    return this.request("PATCH", orgPath(orgID), creds, { body: req, signal: options.signal });
+  updateOrg(orgID: string, req: UpdateOrgRequest, options: { signal?: AbortSignal } = {}): Promise<OrgView> {
+    return this.request("PATCH", orgPath(orgID), { body: req, signal: options.signal });
   }
 
-  deleteOrg(creds: Credentials, orgID: string, options: { signal?: AbortSignal } = {}): Promise<DeleteOrgResult> {
-    return this.request("DELETE", orgPath(orgID), creds, { signal: options.signal });
+  deleteOrg(orgID: string, options: { signal?: AbortSignal } = {}): Promise<DeleteOrgResult> {
+    return this.request("DELETE", orgPath(orgID), { signal: options.signal });
   }
 
-  orgMembers(creds: Credentials, orgID: string, options: { signal?: AbortSignal } = {}): Promise<MembershipView[]> {
-    return this.request("GET", orgPath(orgID, "/members"), creds, { signal: options.signal });
+  listOrgMembers(orgID: string, options: { signal?: AbortSignal } = {}): Promise<MembershipView[]> {
+    return this.request("GET", orgPath(orgID, "/members"), { signal: options.signal });
   }
 
-  updateOrgMember(
-    creds: Credentials,
-    orgID: string,
-    userID: string,
-    req: UpdateMembershipRequest,
-    options: { signal?: AbortSignal } = {}
-  ): Promise<MembershipView> {
-    return this.request("PATCH", orgPath(orgID, `/members/${encodePath(userID)}`), creds, { body: req, signal: options.signal });
+  updateOrgMember(orgID: string, userID: string, req: UpdateMembershipRequest, options: { signal?: AbortSignal } = {}): Promise<MembershipView> {
+    return this.request("PATCH", orgPath(orgID, `/members/${encodePath(userID)}`), { body: req, signal: options.signal });
   }
 
-  removeOrgMember(creds: Credentials, orgID: string, userID: string, options: { signal?: AbortSignal } = {}): Promise<void> {
-    return this.requestVoid("DELETE", orgPath(orgID, `/members/${encodePath(userID)}`), creds, { signal: options.signal });
+  deleteOrgMember(orgID: string, userID: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+    return this.requestVoid("DELETE", orgPath(orgID, `/members/${encodePath(userID)}`), { signal: options.signal });
   }
 
-  invitations(creds: Credentials, orgID: string, options: { signal?: AbortSignal } = {}): Promise<InvitationView[]> {
-    return this.request("GET", orgPath(orgID, "/invitations"), creds, { signal: options.signal });
+  listInvitations(orgID: string, options: { signal?: AbortSignal } = {}): Promise<InvitationView[]> {
+    return this.request("GET", orgPath(orgID, "/invitations"), { signal: options.signal });
   }
 
-  createInvitation(creds: Credentials, orgID: string, req: CreateInvitationRequest, options: { signal?: AbortSignal } = {}): Promise<InvitationView> {
-    return this.request("POST", orgPath(orgID, "/invitations"), creds, { body: req, signal: options.signal });
+  createInvitation(orgID: string, req: CreateInvitationRequest, options: { signal?: AbortSignal } = {}): Promise<InvitationView> {
+    return this.request("POST", orgPath(orgID, "/invitations"), { body: req, signal: options.signal });
   }
 
-  revokeInvitation(creds: Credentials, orgID: string, invitationID: string, options: { signal?: AbortSignal } = {}): Promise<DeleteInvitationResult> {
-    return this.request("DELETE", orgPath(orgID, `/invitations/${encodePath(invitationID)}`), creds, { signal: options.signal });
+  revokeInvitation(orgID: string, invitationID: string, options: { signal?: AbortSignal } = {}): Promise<DeleteInvitationResult> {
+    return this.request("DELETE", orgPath(orgID, `/invitations/${encodePath(invitationID)}`), { signal: options.signal });
   }
 
-  apiKeys(creds: Credentials, options: { signal?: AbortSignal } = {}): Promise<APIKeyView[]> {
-    return this.request("GET", "/api-keys", creds, { signal: options.signal });
+  listAPIKeys(options: { signal?: AbortSignal } = {}): Promise<APIKeyView[]> {
+    return this.request("GET", "/api-keys", { signal: options.signal });
   }
 
-  createAPIKey(creds: Credentials, req: CreateAPIKeyRequest, options: { signal?: AbortSignal } = {}): Promise<CreatedAPIKeyView> {
-    return this.request("POST", "/api-keys", creds, { body: req, signal: options.signal });
+  createAPIKey(req: CreateAPIKeyRequest, options: { signal?: AbortSignal } = {}): Promise<CreatedAPIKeyView> {
+    return this.request("POST", "/api-keys", { body: req, signal: options.signal });
   }
 
-  revokeAPIKey(creds: Credentials, apiKeyID: string, options: { signal?: AbortSignal } = {}): Promise<APIKeyView> {
-    return this.request("DELETE", `/api-keys/${encodePath(apiKeyID)}`, creds, { signal: options.signal });
+  revokeAPIKey(apiKeyID: string, options: { signal?: AbortSignal } = {}): Promise<APIKeyView> {
+    return this.request("DELETE", `/api-keys/${encodePath(apiKeyID)}`, { signal: options.signal });
   }
 
-  orgHosts(creds: Credentials, options: { signal?: AbortSignal } = {}): Promise<OrgHostsView> {
-    return this.request("GET", "/org-runtime/hosts", creds, { signal: options.signal });
+  getOrgHosts(options: { signal?: AbortSignal } = {}): Promise<OrgHostsView> {
+    return this.request("GET", "/org-runtime/hosts", { signal: options.signal });
   }
 
-  createBox(creds: Credentials, req: CreateBoxRequest, options: { signal?: AbortSignal } = {}): Promise<BoxView> {
-    return this.request("POST", this.workspacePath("/boxes"), creds, { body: req, signal: options.signal });
+  createBox(req: CreateBoxRequest, options: { signal?: AbortSignal } = {}): Promise<BoxView> {
+    return this.request("POST", this.workspacePath("/boxes"), { body: req, signal: options.signal });
   }
 
-  boxes(creds: Credentials, filters: BoxesFilters = {}, options: { signal?: AbortSignal } = {}): Promise<BoxView[]> {
-    return this.request("GET", this.workspacePath("/boxes"), creds, {
+  listBoxes(req: ListBoxesRequest = {}, options: { signal?: AbortSignal } = {}): Promise<BoxView[]> {
+    return this.request("GET", this.workspacePath("/boxes"), {
       query: {
-        creator: trimmed(filters.creator),
-        label: trimmed(filters.label),
-        state: trimmed(filters.state)
+        creator: trimmed(req.creator),
+        label: trimmed(req.label),
+        state: trimmed(req.state)
       },
       signal: options.signal
     });
   }
 
-  box(creds: Credentials, boxID: string, options: { signal?: AbortSignal } = {}): Promise<BoxView> {
-    return this.request("GET", this.workspacePath(`/boxes/${encodePath(boxID)}`), creds, { signal: options.signal });
+  getBox(boxID: string, options: { signal?: AbortSignal } = {}): Promise<BoxView> {
+    return this.request("GET", this.workspacePath(`/boxes/${encodePath(boxID)}`), { signal: options.signal });
   }
 
-  updateBox(creds: Credentials, boxID: string, req: UpdateBoxRequest, options: { signal?: AbortSignal } = {}): Promise<BoxView> {
-    return this.request("PATCH", this.workspacePath(`/boxes/${encodePath(boxID)}`), creds, { body: req, signal: options.signal });
+  updateBox(boxID: string, req: UpdateBoxRequest, options: { signal?: AbortSignal } = {}): Promise<BoxView> {
+    return this.request("PATCH", this.workspacePath(`/boxes/${encodePath(boxID)}`), { body: req, signal: options.signal });
   }
 
-  stopBox(creds: Credentials, boxID: string, options: { signal?: AbortSignal } = {}): Promise<BoxView> {
-    return this.request("POST", this.workspacePath(`/boxes/${encodePath(boxID)}/stop`), creds, { signal: options.signal });
+  stopBox(boxID: string, options: { signal?: AbortSignal } = {}): Promise<BoxView> {
+    return this.request("POST", this.workspacePath(`/boxes/${encodePath(boxID)}/stop`), { signal: options.signal });
   }
 
-  removeBox(creds: Credentials, boxID: string, options: { signal?: AbortSignal } = {}): Promise<BoxView> {
-    return this.request("DELETE", this.workspacePath(`/boxes/${encodePath(boxID)}`), creds, { signal: options.signal });
+  deleteBox(boxID: string, options: { signal?: AbortSignal } = {}): Promise<BoxView> {
+    return this.request("DELETE", this.workspacePath(`/boxes/${encodePath(boxID)}`), { signal: options.signal });
   }
 
-  importSnap(creds: Credentials, imageRef: string, options: { signal?: AbortSignal } = {}): Promise<SnapView> {
-    return this.request("POST", this.workspacePath("/snaps/import"), creds, {
-      body: { image_ref: imageRef.trim() },
+  importSnap(req: ImportSnapRequest, options: { signal?: AbortSignal } = {}): Promise<SnapView> {
+    return this.request("POST", this.workspacePath("/snaps/import"), {
+      body: { image_ref: req.image_ref.trim() },
       signal: options.signal
     });
   }
 
-  snaps(creds: Credentials, filters: SnapsFilters = {}, options: { signal?: AbortSignal } = {}): Promise<SnapView[]> {
-    return this.request("GET", this.workspacePath("/snaps"), creds, {
-      query: { attached: trimmed(filters.attached) },
+  listSnaps(req: ListSnapsRequest = {}, options: { signal?: AbortSignal } = {}): Promise<SnapView[]> {
+    return this.request("GET", this.workspacePath("/snaps"), {
+      query: { attached: req.attached === undefined ? undefined : String(req.attached) },
       signal: options.signal
     });
   }
 
-  snap(creds: Credentials, snapID: string, options: { signal?: AbortSignal } = {}): Promise<SnapView> {
-    return this.request("GET", this.workspacePath(`/snaps/${encodePath(snapID)}`), creds, { signal: options.signal });
+  getSnap(snapID: string, options: { signal?: AbortSignal } = {}): Promise<SnapView> {
+    return this.request("GET", this.workspacePath(`/snaps/${encodePath(snapID)}`), { signal: options.signal });
   }
 
-  forkSnap(creds: Credentials, snapID: string, options: { signal?: AbortSignal } = {}): Promise<SnapView> {
-    return this.request("POST", this.workspacePath(`/snaps/${encodePath(snapID)}/fork`), creds, { signal: options.signal });
+  forkSnap(snapID: string, options: { signal?: AbortSignal } = {}): Promise<SnapView> {
+    return this.request("POST", this.workspacePath(`/snaps/${encodePath(snapID)}/fork`), { signal: options.signal });
   }
 
-  removeSnap(creds: Credentials, snapID: string, options: { signal?: AbortSignal } = {}): Promise<SnapView> {
-    return this.request("DELETE", this.workspacePath(`/snaps/${encodePath(snapID)}`), creds, { signal: options.signal });
+  deleteSnap(snapID: string, options: { signal?: AbortSignal } = {}): Promise<SnapView> {
+    return this.request("DELETE", this.workspacePath(`/snaps/${encodePath(snapID)}`), { signal: options.signal });
   }
 
-  snapTree(creds: Credentials, snapID: string, options: { signal?: AbortSignal } = {}): Promise<SnapTreeView> {
-    return this.request("GET", this.workspacePath(`/snaps/${encodePath(snapID)}/tree`), creds, { signal: options.signal });
+  getSnapTree(snapID: string, options: { signal?: AbortSignal } = {}): Promise<SnapTreeView> {
+    return this.request("GET", this.workspacePath(`/snaps/${encodePath(snapID)}/tree`), { signal: options.signal });
   }
 
-  exec(creds: Credentials, boxID: string, req: ExecBoxRequest, options: { signal?: AbortSignal } = {}): Promise<ExecView> {
-    return this.request("POST", this.workspacePath(`/boxes/${encodePath(boxID)}/execs`), creds, { body: req, signal: options.signal });
+  startExec(boxID: string, req: ExecRequest, options: { signal?: AbortSignal } = {}): Promise<ExecView> {
+    return this.request("POST", this.workspacePath(`/boxes/${encodePath(boxID)}/execs`), { body: req, signal: options.signal });
   }
 
-  backgroundExec(creds: Credentials, boxID: string, req: ExecBoxRequest, options: { signal?: AbortSignal } = {}): Promise<ExecView> {
-    return this.request("POST", this.workspacePath(`/boxes/${encodePath(boxID)}/background-execs`), creds, { body: req, signal: options.signal });
+  startBackgroundExec(boxID: string, req: ExecRequest, options: { signal?: AbortSignal } = {}): Promise<ExecView> {
+    return this.request("POST", this.workspacePath(`/boxes/${encodePath(boxID)}/background-execs`), { body: req, signal: options.signal });
   }
 
-  async execStream(creds: Credentials, boxID: string, req: ExecBoxRequest, options: { signal?: AbortSignal } = {}): Promise<ExecStreamResult> {
-    const response = await this.rawRequest("POST", this.workspacePath(`/boxes/${encodePath(boxID)}/execs/stream`), creds, {
+  async startExecStream(boxID: string, req: ExecRequest, options: { signal?: AbortSignal } = {}): Promise<ExecStream> {
+    const response = await this.rawRequest("POST", this.workspacePath(`/boxes/${encodePath(boxID)}/execs/stream`), {
       body: req,
       headers: {
         Accept: "application/x-ndjson",
@@ -383,14 +417,11 @@ export class Run9Client {
     if (!response.body) {
       throw new Error("portal api returned empty response body");
     }
-    return {
-      execID: response.headers.get("X-Run9-Exec-ID")?.trim() ?? "",
-      body: response.body
-    };
+    return new ExecStream(response.headers.get("X-Run9-Exec-ID")?.trim() ?? "", response.body);
   }
 
-  async execs(creds: Credentials, req: ExecListRequest = {}, options: { signal?: AbortSignal } = {}): Promise<ExecListResult> {
-    const response = await this.rawRequest("GET", this.workspacePath("/execs"), creds, {
+  async listExecs(req: ListExecsRequest = {}, options: { signal?: AbortSignal } = {}): Promise<ListExecsResult> {
+    const response = await this.rawRequest("GET", this.workspacePath("/execs"), {
       query: {
         box_id: trimmed(req.boxID),
         state: trimmed(req.state),
@@ -411,25 +442,23 @@ export class Run9Client {
     };
   }
 
-  execByID(creds: Credentials, execID: string, options: { signal?: AbortSignal } = {}): Promise<ExecView> {
-    return this.request("GET", this.workspacePath(`/execs/${encodePath(execID)}`), creds, { signal: options.signal });
+  getExec(execID: string, options: { signal?: AbortSignal } = {}): Promise<ExecView> {
+    return this.request("GET", this.workspacePath(`/execs/${encodePath(execID)}`), { signal: options.signal });
   }
 
-  downloadExecLog(creds: Credentials, execID: string, options: { signal?: AbortSignal } = {}): Promise<ReadableStream<Uint8Array>> {
-    return this.download("GET", this.workspacePath(`/execs/${encodePath(execID)}/log-download`), creds, { signal: options.signal });
+  downloadExecLog(execID: string, options: { signal?: AbortSignal } = {}): Promise<ReadableStream<Uint8Array>> {
+    return this.download("GET", this.workspacePath(`/execs/${encodePath(execID)}/log-download`), { signal: options.signal });
   }
 
   async pullBackgroundExecOutput(
-    creds: Credentials,
     execID: string,
-    cursor = "",
-    waitMs = 0,
+    req: PullBackgroundExecOutputRequest = {},
     options: { signal?: AbortSignal } = {}
   ): Promise<BackgroundExecPullOutput> {
-    const response = await this.rawRequest("POST", this.workspacePath(`/execs/${encodePath(execID)}/pull-output`), creds, {
+    const response = await this.rawRequest("POST", this.workspacePath(`/execs/${encodePath(execID)}/pull-output`), {
       body: {
-        cursor: cursor.trim() || undefined,
-        wait_ms: waitMs > 0 ? waitMs : undefined
+        cursor: trimmed(req.cursor),
+        wait_ms: req.wait && req.wait > 0 ? req.wait : undefined
       },
       signal: options.signal
     });
@@ -441,41 +470,33 @@ export class Run9Client {
       state: response.headers.get("X-Run9-Exec-State")?.trim() ?? "",
       exitCode: rawExitCode ? parseStrictInteger(rawExitCode, "X-Run9-Exit-Code") : undefined,
       reason: response.headers.get("X-Run9-Reason")?.trim() ?? "",
-      idleDeadlineAt: response.headers.get("X-Run9-Idle-Deadline-At")?.trim() || undefined
+      idleDeadlineAt: parseOptionalHeaderDate(response.headers, "X-Run9-Idle-Deadline-At")
     };
   }
 
   async writeBackgroundExecStdin(
-    creds: Credentials,
     execID: string,
-    data: BodyInit,
-    closeStdin = false,
+    req: WriteBackgroundExecStdinRequest,
     options: { signal?: AbortSignal } = {}
   ): Promise<string | undefined> {
-    const response = await this.rawRequest("POST", this.workspacePath(`/execs/${encodePath(execID)}/write-stdin`), creds, {
-      body: data,
+    const response = await this.rawRequest("POST", this.workspacePath(`/execs/${encodePath(execID)}/write-stdin`), {
+      body: req.data,
       headers: {
         "Content-Type": "application/octet-stream",
-        "X-Run9-Close-Stdin": String(closeStdin)
+        "X-Run9-Close-Stdin": String(req.closeStdin ?? false)
       },
       signal: options.signal
     });
     await drain(response);
-    return response.headers.get("X-Run9-Idle-Deadline-At")?.trim() || undefined;
+    return parseOptionalHeaderDate(response.headers, "X-Run9-Idle-Deadline-At");
   }
 
-  killBackgroundExec(creds: Credentials, execID: string, options: { signal?: AbortSignal } = {}): Promise<void> {
-    return this.requestVoid("POST", this.workspacePath(`/execs/${encodePath(execID)}/kill`), creds, { signal: options.signal });
+  killBackgroundExec(execID: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+    return this.requestVoid("POST", this.workspacePath(`/execs/${encodePath(execID)}/kill`), { signal: options.signal });
   }
 
-  uploadArchive(
-    creds: Credentials,
-    boxID: string,
-    boxAbsPath: string,
-    source: BodyInit,
-    options: { signal?: AbortSignal } = {}
-  ): Promise<RuntimeRequestView> {
-    return this.request("POST", this.workspacePath(`/boxes/${encodePath(boxID)}/files/upload`), creds, {
+  uploadArchive(boxID: string, boxAbsPath: string, source: BodyInit, options: { signal?: AbortSignal } = {}): Promise<RuntimeRequestView> {
+    return this.request("POST", this.workspacePath(`/boxes/${encodePath(boxID)}/files/upload`), {
       query: { box_abs_path: boxAbsPath.trim() },
       headers: { "Content-Type": "application/x-tar" },
       body: source,
@@ -483,8 +504,8 @@ export class Run9Client {
     });
   }
 
-  downloadArchive(creds: Credentials, boxID: string, boxAbsPath: string, options: { signal?: AbortSignal } = {}): Promise<ReadableStream<Uint8Array>> {
-    return this.download("GET", this.workspacePath(`/boxes/${encodePath(boxID)}/files/download`), creds, {
+  downloadArchive(boxID: string, boxAbsPath: string, options: { signal?: AbortSignal } = {}): Promise<ReadableStream<Uint8Array>> {
+    return this.download("GET", this.workspacePath(`/boxes/${encodePath(boxID)}/files/download`), {
       query: {
         archive: "tar",
         box_abs_path: boxAbsPath.trim()
@@ -493,89 +514,67 @@ export class Run9Client {
     });
   }
 
-  projectSecrets(creds: Credentials, projectCID: string, options: { signal?: AbortSignal } = {}): Promise<ProjectSecretView[]> {
-    return this.request("GET", projectPath(projectCID, "/secrets"), creds, { signal: options.signal });
+  listProjectSecrets(options: { signal?: AbortSignal } = {}): Promise<ProjectSecretView[]> {
+    return this.request("GET", projectPath(this.projectCID, "/secrets"), { signal: options.signal });
   }
 
-  createProjectSecret(creds: Credentials, projectCID: string, req: CreateProjectSecretRequest, options: { signal?: AbortSignal } = {}): Promise<ProjectSecretView> {
-    return this.request("POST", projectPath(projectCID, "/secrets"), creds, { body: req, signal: options.signal });
+  createProjectSecret(req: CreateProjectSecretRequest, options: { signal?: AbortSignal } = {}): Promise<ProjectSecretView> {
+    return this.request("POST", projectPath(this.projectCID, "/secrets"), { body: req, signal: options.signal });
   }
 
-  updateProjectSecret(
-    creds: Credentials,
-    projectCID: string,
-    secretID: string,
-    req: UpdateProjectSecretRequest,
-    options: { signal?: AbortSignal } = {}
-  ): Promise<ProjectSecretView> {
-    return this.request("PATCH", projectPath(projectCID, `/secrets/${encodePath(secretID)}`), creds, { body: req, signal: options.signal });
+  updateProjectSecret(secretID: string, req: UpdateProjectSecretRequest, options: { signal?: AbortSignal } = {}): Promise<ProjectSecretView> {
+    return this.request("PATCH", projectPath(this.projectCID, `/secrets/${encodePath(secretID)}`), { body: req, signal: options.signal });
   }
 
-  deleteProjectSecret(creds: Credentials, projectCID: string, secretID: string, options: { signal?: AbortSignal } = {}): Promise<void> {
-    return this.requestVoid("DELETE", projectPath(projectCID, `/secrets/${encodePath(secretID)}`), creds, { signal: options.signal });
+  deleteProjectSecret(secretID: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+    return this.requestVoid("DELETE", projectPath(this.projectCID, `/secrets/${encodePath(secretID)}`), { signal: options.signal });
   }
 
-  boxSecrets(creds: Credentials, boxID: string, options: { signal?: AbortSignal } = {}): Promise<ProjectSecretView[]> {
-    return this.request("GET", this.workspacePath(boxSecretPath(boxID)), creds, { signal: options.signal });
+  listBoxSecrets(boxID: string, options: { signal?: AbortSignal } = {}): Promise<ProjectSecretView[]> {
+    return this.request("GET", this.workspacePath(boxSecretPath(boxID)), { signal: options.signal });
   }
 
-  createBoxSecret(creds: Credentials, boxID: string, req: CreateProjectSecretRequest, options: { signal?: AbortSignal } = {}): Promise<ProjectSecretView> {
-    return this.request("POST", this.workspacePath(boxSecretPath(boxID)), creds, { body: req, signal: options.signal });
+  createBoxSecret(boxID: string, req: CreateProjectSecretRequest, options: { signal?: AbortSignal } = {}): Promise<ProjectSecretView> {
+    return this.request("POST", this.workspacePath(boxSecretPath(boxID)), { body: req, signal: options.signal });
   }
 
-  updateBoxSecret(
-    creds: Credentials,
-    boxID: string,
-    secretID: string,
-    req: UpdateProjectSecretRequest,
-    options: { signal?: AbortSignal } = {}
-  ): Promise<ProjectSecretView> {
-    return this.request("PATCH", this.workspacePath(boxSecretPath(boxID, secretID)), creds, { body: req, signal: options.signal });
+  updateBoxSecret(boxID: string, secretID: string, req: UpdateProjectSecretRequest, options: { signal?: AbortSignal } = {}): Promise<ProjectSecretView> {
+    return this.request("PATCH", this.workspacePath(boxSecretPath(boxID, secretID)), { body: req, signal: options.signal });
   }
 
-  deleteBoxSecret(creds: Credentials, boxID: string, secretID: string, options: { signal?: AbortSignal } = {}): Promise<void> {
-    return this.requestVoid("DELETE", this.workspacePath(boxSecretPath(boxID, secretID)), creds, { signal: options.signal });
+  deleteBoxSecret(boxID: string, secretID: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+    return this.requestVoid("DELETE", this.workspacePath(boxSecretPath(boxID, secretID)), { signal: options.signal });
   }
 
-  sharedSnaps(creds: Credentials, options: { signal?: AbortSignal } = {}): Promise<SharedSnapLineView[]> {
-    return this.request("GET", "/shared-snaps", creds, { signal: options.signal });
+  listSharedSnaps(options: { signal?: AbortSignal } = {}): Promise<SharedSnapLineView[]> {
+    return this.request("GET", "/shared-snaps", { signal: options.signal });
   }
 
-  sharedSnapDetail(creds: Credentials, name: string, options: { signal?: AbortSignal } = {}): Promise<SharedSnapDetailView> {
-    return this.request("GET", `/shared-snaps/${encodePath(name)}`, creds, { signal: options.signal });
+  getSharedSnap(name: string, options: { signal?: AbortSignal } = {}): Promise<SharedSnapDetailView> {
+    return this.request("GET", `/shared-snaps/${encodePath(name)}`, { signal: options.signal });
   }
 
-  publishSharedSnap(creds: Credentials, req: PublishSharedSnapRequest, options: { signal?: AbortSignal } = {}): Promise<SharedSnapVersionView> {
-    return this.request("POST", "/shared-snaps", creds, { body: req, signal: options.signal });
+  publishSharedSnap(req: PublishSharedSnapRequest, options: { signal?: AbortSignal } = {}): Promise<SharedSnapVersionView> {
+    return this.request("POST", "/shared-snaps", { body: req, signal: options.signal });
   }
 
-  deleteSharedSnap(creds: Credentials, name: string, options: { signal?: AbortSignal } = {}): Promise<void> {
-    return this.requestVoid("DELETE", `/shared-snaps/${encodePath(name)}`, creds, { signal: options.signal });
+  deleteSharedSnap(name: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+    return this.requestVoid("DELETE", `/shared-snaps/${encodePath(name)}`, { signal: options.signal });
   }
 
-  deleteSharedSnapVersion(creds: Credentials, name: string, version: number, options: { signal?: AbortSignal } = {}): Promise<void> {
-    return this.requestVoid("DELETE", `/shared-snaps/${encodePath(name)}/versions/${version}`, creds, { signal: options.signal });
+  deleteSharedSnapVersion(name: string, version: number, options: { signal?: AbortSignal } = {}): Promise<void> {
+    return this.requestVoid("DELETE", `/shared-snaps/${encodePath(name)}/versions/${version}`, { signal: options.signal });
   }
 
-  createBoxFromSharedSnap(
-    creds: Credentials,
-    name: string,
-    req: CreateBoxFromSharedSnapRequest,
-    options: { signal?: AbortSignal } = {}
-  ): Promise<BoxView> {
-    return this.request("POST", this.workspacePath(`/shared-snaps/${encodePath(name)}/boxes`), creds, { body: req, signal: options.signal });
+  createBoxFromSharedSnap(name: string, req: CreateBoxFromSharedSnapRequest, options: { signal?: AbortSignal } = {}): Promise<BoxView> {
+    return this.request("POST", this.workspacePath(`/shared-snaps/${encodePath(name)}/boxes`), { body: req, signal: options.signal });
   }
 
-  createSnapFromSharedSnap(
-    creds: Credentials,
-    name: string,
-    req: CreateSnapFromSharedSnapRequest,
-    options: { signal?: AbortSignal } = {}
-  ): Promise<SnapView> {
-    return this.request("POST", this.workspacePath(`/shared-snaps/${encodePath(name)}/snaps`), creds, { body: req, signal: options.signal });
+  createSnapFromSharedSnap(name: string, req: CreateSnapFromSharedSnapRequest, options: { signal?: AbortSignal } = {}): Promise<SnapView> {
+    return this.request("POST", this.workspacePath(`/shared-snaps/${encodePath(name)}/snaps`), { body: req, signal: options.signal });
   }
 
-  async execAttachURL(attachURL: string): Promise<ExecAttachSocket> {
+  async openExecAttach(attachURL: string): Promise<ExecAttachSocket> {
     const httpURL = resolveHTTPURL(this.baseURL, attachURL);
     const wsURL = websocketURL(httpURL);
     const socket = new WebSocket(wsURL, { handshakeTimeout: 15_000 });
@@ -617,28 +616,28 @@ export class Run9Client {
     return attachSocket;
   }
 
-  private async request<T>(method: string, path: string, creds: Credentials, options: RequestOptions = {}): Promise<T> {
-    const response = await this.rawRequest(method, path, creds, options);
+  private async request<T>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
+    const response = await this.rawRequest(method, path, options);
     return decodeJSON<T>(response);
   }
 
-  private async requestVoid(method: string, path: string, creds: Credentials, options: RequestOptions = {}): Promise<void> {
-    const response = await this.rawRequest(method, path, creds, options);
+  private async requestVoid(method: string, path: string, options: RequestOptions = {}): Promise<void> {
+    const response = await this.rawRequest(method, path, options);
     await drain(response);
   }
 
-  private async download(method: string, path: string, creds: Credentials, options: RequestOptions = {}): Promise<ReadableStream<Uint8Array>> {
-    const response = await this.rawRequest(method, path, creds, options);
+  private async download(method: string, path: string, options: RequestOptions = {}): Promise<ReadableStream<Uint8Array>> {
+    const response = await this.rawRequest(method, path, options);
     if (!response.body) {
       throw new Error("portal api returned empty response body");
     }
     return response.body;
   }
 
-  private async rawRequest(method: string, path: string, creds: Credentials, options: RequestOptions = {}): Promise<Response> {
+  private async rawRequest(method: string, path: string, options: RequestOptions = {}): Promise<Response> {
     const response = await this.fetchImpl(this.requestURL(path, options.query), {
       method,
-      headers: this.headers(creds, options),
+      headers: this.headers(options),
       body: requestBody(options.body),
       signal: options.signal,
       ...duplexOption(options.body)
@@ -649,9 +648,9 @@ export class Run9Client {
     return response;
   }
 
-  private headers(creds: Credentials, options: RequestOptions): Headers {
+  private headers(options: RequestOptions): Headers {
     const headers = new Headers(options.headers);
-    headers.set("Authorization", `Basic ${Buffer.from(`${creds.ak}:${creds.sk}`).toString("base64")}`);
+    headers.set("Authorization", `Basic ${Buffer.from(`${this.creds.ak}:${this.creds.sk}`).toString("base64")}`);
     if (!headers.has("Accept")) {
       headers.set("Accept", "application/json");
     }
@@ -676,10 +675,7 @@ export class Run9Client {
 
   private workspacePath(path: string): string {
     const cleanPath = `/${path.trim().replace(/^\/+/, "")}`;
-    if (!this.projectCID.trim()) {
-      return cleanPath;
-    }
-    return `/projects/${encodePath(this.projectCID)}/workspace${cleanPath}`;
+    return `${projectPath(this.projectCID, "/workspace")}${cleanPath}`;
   }
 }
 
@@ -761,6 +757,18 @@ function parseStrictInteger(value: string, headerName: string): number {
   return Number.parseInt(value, 10);
 }
 
+function parseOptionalHeaderDate(headers: Headers, headerName: string): string | undefined {
+  const value = headers.get(headerName)?.trim();
+  if (!value) {
+    return undefined;
+  }
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) {
+    throw new Error(`invalid ${headerName} header: ${value}`);
+  }
+  return value;
+}
+
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
@@ -782,7 +790,11 @@ function dateParam(value: string | Date | undefined): string | undefined {
 }
 
 function projectPath(projectCID: string, suffix = ""): string {
-  return joinPath(`/projects/${encodePath(projectCID)}`, suffix);
+  const cleanProjectCID = projectCID.trim();
+  if (!cleanProjectCID) {
+    throw new Error("missing project cid: use client.withProject(...) for project-scoped APIs");
+  }
+  return joinPath(`/projects/${encodePath(cleanProjectCID)}`, suffix);
 }
 
 function orgPath(orgID: string, suffix = ""): string {
@@ -822,6 +834,39 @@ function websocketURL(httpURL: string): string {
   }
   parsed.hash = "";
   return parsed.toString();
+}
+
+function normalizeEndpoint(endpoint: string): string {
+  const trimmedEndpoint = endpoint.trim();
+  if (!trimmedEndpoint) {
+    throw new Error("missing run9 endpoint");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmedEndpoint);
+  } catch (error) {
+    throw new Error(`parse endpoint: ${asError(error).message}`);
+  }
+  if (!parsed.protocol || !parsed.host) {
+    throw new Error(`invalid endpoint: ${endpoint}`);
+  }
+  if (parsed.search || parsed.hash) {
+    throw new Error(`invalid endpoint: must not contain query or fragment: ${endpoint}`);
+  }
+  parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+  return parsed.toString();
+}
+
+function normalizeCredentials(creds: Credentials): Credentials {
+  const ak = creds.ak.trim();
+  const sk = creds.sk.trim();
+  if (!ak) {
+    throw new Error("missing run9 access key");
+  }
+  if (!sk) {
+    throw new Error("missing run9 secret key");
+  }
+  return { ak, sk };
 }
 
 function asBuffers(data: WebSocket.RawData): Buffer[] {

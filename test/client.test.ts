@@ -1,25 +1,34 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { once } from "node:events";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { describe, expect, it } from "vitest";
 import { WebSocketServer } from "ws";
-import { Run9Client, Run9Error, type CreateProjectRequest, type ExecListRequest, type UpdateBoxRequest } from "../src/index.js";
+import { Run9Client, Run9Error, type CreateProjectRequest, type ListExecsRequest, type UpdateBoxRequest } from "../src/index.js";
 
 const creds = { ak: "ak-1", sk: "sk-1" };
 
 describe("Run9Client", () => {
-  it("normalizes base URL and preserves path prefixes", async () => {
+  it("normalizes base URL, preserves path prefixes, and binds credentials", async () => {
     const server = await testServer((req, res) => {
-      expect(req.url).toBe("/api/boxes");
+      expect(req.url).toBe("/api/whoami");
       expect(req.method).toBe("GET");
-      respondJSON(res, []);
+      expect(req.headers.authorization).toBe(`Basic ${Buffer.from("ak-1:sk-1").toString("base64")}`);
+      respondJSON(res, { user: { user_id: "u-1" }, org: { org_id: "org-1" }, auth_kind: "api_key" });
     });
 
     try {
-      const boxes = await new Run9Client(`${server.url}/api/`).boxes(creds);
-      expect(boxes).toEqual([]);
+      const identity = await new Run9Client(`${server.url}/api/`, creds).whoAmI();
+      expect(identity.auth_kind).toBe("api_key");
     } finally {
       await server.close();
     }
+  });
+
+  it("rejects missing credentials and project-scoped calls without a project", () => {
+    expect(() => new Run9Client("http://127.0.0.1", { ak: "", sk: "sk" })).toThrow("missing run9 access key");
+    expect(() => new Run9Client("http://127.0.0.1?x=1", creds)).toThrow("invalid endpoint: must not contain query or fragment");
+    expect(() => new Run9Client("http://127.0.0.1", creds).listBoxes()).toThrow(
+      "missing project cid: use client.withProject(...) for project-scoped APIs"
+    );
   });
 
   it("uses project workspace paths", async () => {
@@ -30,7 +39,7 @@ describe("Run9Client", () => {
     });
 
     try {
-      const boxes = await new Run9Client(`${server.url}/api`).withProject("default").boxes(creds, {
+      const boxes = await new Run9Client(`${server.url}/api`, creds).withProject("default").listBoxes({
         state: "running"
       });
       expect(boxes).toEqual([]);
@@ -39,11 +48,10 @@ describe("Run9Client", () => {
     }
   });
 
-  it("sends basic auth and JSON payloads", async () => {
+  it("sends JSON payloads", async () => {
     const server = await testServer(async (req, res) => {
       expect(req.url).toBe("/projects");
       expect(req.method).toBe("POST");
-      expect(req.headers.authorization).toBe(`Basic ${Buffer.from("ak-1:sk-1").toString("base64")}`);
       expect(req.headers.accept).toBe("application/json");
       expect(req.headers["content-type"]).toContain("application/json");
       const body = (await readBody(req)) as CreateProjectRequest;
@@ -52,7 +60,7 @@ describe("Run9Client", () => {
     });
 
     try {
-      const project = await new Run9Client(server.url).createProject(creds, {
+      const project = await new Run9Client(server.url, creds).createProject({
         display_name: "Sandbox",
         description: "Isolated experiments"
       });
@@ -77,7 +85,7 @@ describe("Run9Client", () => {
     });
 
     try {
-      const box = await new Run9Client(server.url).withProject("default").updateBox(creds, " box-1 ", {
+      const box = await new Run9Client(server.url, creds).withProject("default").updateBox(" box-1 ", {
         labels: {},
         desired_shape: "2c4g",
         network_mode: "managed",
@@ -103,13 +111,13 @@ describe("Run9Client", () => {
     });
 
     try {
-      const req: ExecListRequest = {
+      const req: ListExecsRequest = {
         boxID: "box-1",
         acceptedAfter,
         paged: true,
         limit: 10
       };
-      const result = await new Run9Client(server.url).withProject("default").execs(creds, req);
+      const result = await new Run9Client(server.url, creds).withProject("default").listExecs(req);
       expect(result.execs).toEqual([]);
       expect(result.nextCursor).toBe("cursor-2");
     } finally {
@@ -123,7 +131,7 @@ describe("Run9Client", () => {
     });
 
     try {
-      await expect(new Run9Client(server.url).boxes(creds, { state: "broken" })).rejects.toMatchObject({
+      await expect(new Run9Client(server.url, creds).withProject("default").listBoxes({ state: "broken" })).rejects.toMatchObject({
         statusCode: 400,
         message: "invalid state filter"
       } satisfies Partial<Run9Error>);
@@ -135,7 +143,7 @@ describe("Run9Client", () => {
   it("preserves explicit archive upload content type", async () => {
     const server = await testServer(async (req, res) => {
       const url = new URL(req.url ?? "/", "http://local");
-      expect(url.pathname).toBe("/boxes/box-1/files/upload");
+      expect(url.pathname).toBe("/projects/default/workspace/boxes/box-1/files/upload");
       expect(url.searchParams.get("box_abs_path")).toBe("/work/result.txt");
       expect(req.headers["content-type"]).toBe("application/x-tar");
       expect(await readText(req)).toBe("tar-body");
@@ -143,8 +151,27 @@ describe("Run9Client", () => {
     });
 
     try {
-      const view = await new Run9Client(server.url).uploadArchive(creds, "box-1", "/work/result.txt", "tar-body");
+      const view = await new Run9Client(server.url, creds).withProject("default").uploadArchive("box-1", "/work/result.txt", "tar-body");
       expect(view.runtime_request_id).toBe("runtime-upload-1");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("reads foreground exec stream events", async () => {
+    const server = await testServer((_req, res) => {
+      expect(_req.url).toBe("/projects/default/workspace/boxes/box-1/execs/stream");
+      res.setHeader("X-Run9-Exec-ID", "exec-stream-1");
+      res.end(`${JSON.stringify({ type: "stdout", data: Buffer.from("hi").toString("base64") })}\n`);
+    });
+
+    try {
+      const stream = await new Run9Client(server.url, creds).withProject("default").startExecStream("box-1", { command: ["echo", "hi"] });
+      expect(stream.execID).toBe("exec-stream-1");
+      const event = await stream.readEvent();
+      expect(event.type).toBe("stdout");
+      expect(Buffer.from(event.data ?? new Uint8Array()).toString("utf8")).toBe("hi");
+      await stream.close();
     } finally {
       await server.close();
     }
@@ -152,7 +179,7 @@ describe("Run9Client", () => {
 
   it("reads background exec output body and headers", async () => {
     const server = await testServer(async (req, res) => {
-      expect(req.url).toBe("/execs/exec-1/pull-output");
+      expect(req.url).toBe("/projects/default/workspace/execs/exec-1/pull-output");
       expect(req.method).toBe("POST");
       expect(await readBody(req)).toEqual({ cursor: "cursor-1", wait_ms: 2000 });
       res.setHeader("X-Run9-Next-Cursor", "cursor-2");
@@ -164,7 +191,10 @@ describe("Run9Client", () => {
     });
 
     try {
-      const result = await new Run9Client(server.url).pullBackgroundExecOutput(creds, "exec-1", "cursor-1", 2000);
+      const result = await new Run9Client(server.url, creds).withProject("default").pullBackgroundExecOutput("exec-1", {
+        cursor: "cursor-1",
+        wait: 2000
+      });
       expect(Buffer.from(result.body).toString("utf8")).toBe("binary-body");
       expect(result.nextCursor).toBe("cursor-2");
       expect(result.state).toBe("running");
@@ -183,7 +213,7 @@ describe("Run9Client", () => {
     });
 
     try {
-      await expect(new Run9Client(server.url).pullBackgroundExecOutput(creds, "exec-1")).rejects.toThrow(
+      await expect(new Run9Client(server.url, creds).withProject("default").pullBackgroundExecOutput("exec-1")).rejects.toThrow(
         "invalid X-Run9-Exit-Code header: 12abc"
       );
     } finally {
@@ -202,7 +232,7 @@ describe("Run9Client", () => {
     });
 
     try {
-      const socket = await new Run9Client(server.url).execAttachURL("/attach");
+      const socket = await new Run9Client(server.url, creds).openExecAttach("/attach");
       await new Promise((resolve) => setTimeout(resolve, 25));
       const event = await socket.readEvent();
       expect(event.type).toBe("stdout");
@@ -238,7 +268,7 @@ describe("Run9Client", () => {
     });
 
     try {
-      await expect(new Run9Client(server.url).execAttachURL("/attach")).rejects.toMatchObject({
+      await expect(new Run9Client(server.url, creds).openExecAttach("/attach")).rejects.toMatchObject({
         statusCode: 403,
         message: "exec attach denied"
       } satisfies Partial<Run9Error>);
