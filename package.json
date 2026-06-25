@@ -1,6 +1,6 @@
 {
   "name": "run9-sdk-ts",
-  "version": "0.1.1",
+  "version": "0.3.0",
   "description": "TypeScript SDK for the run9 control-plane API.",
   "license": "MIT",
   "repository": {

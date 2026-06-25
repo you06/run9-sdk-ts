@@ -2,12 +2,13 @@ import WebSocket from "ws";
 import type { IncomingMessage } from "node:http";
 import type {
   APIKeyView,
-  BackgroundExecPullOutput,
+  BackgroundExecOutputEvent,
   BoxView,
   CreateAPIKeyRequest,
   CreateBoxFromSharedSnapRequest,
   CreateBoxRequest,
   CreateInvitationRequest,
+  ExecCapture,
   ImportSnapRequest,
   CreateProjectRequest,
   CreateProjectSecretRequest,
@@ -20,8 +21,11 @@ import type {
   DeleteOrgResult,
   DeleteProjectResult,
   ExecAttachInput,
+  ExecOutputWriter,
+  ExecOutputWriters,
   ExecRequest,
   ExecStreamEvent,
+  ExecTerminalResult,
   ExecView,
   InvitationView,
   ListBoxesRequest,
@@ -140,6 +144,10 @@ export class ExecAttachSocket {
     this.socket.close();
   }
 
+  pump(writers: ExecOutputWriters = {}, options: { signal?: AbortSignal } = {}): Promise<ExecTerminalResult> {
+    return pumpExecEvents(this, writers, options);
+  }
+
   private push(item: { event?: ExecStreamEvent; error?: Error }): void {
     const reader = this.readers.shift();
     if (reader) {
@@ -202,6 +210,10 @@ export class ExecStream {
     await this.reader.cancel();
   }
 
+  pump(writers: ExecOutputWriters = {}, options: { signal?: AbortSignal } = {}): Promise<ExecTerminalResult> {
+    return pumpExecEvents(this, writers, options);
+  }
+
   private shiftLine(): string | undefined {
     const index = this.buffered.indexOf("\n");
     if (index < 0) {
@@ -210,6 +222,102 @@ export class ExecStream {
     const line = this.buffered.slice(0, index).trim();
     this.buffered = this.buffered.slice(index + 1);
     return line || this.shiftLine();
+  }
+}
+
+export class BackgroundExecPullOutput {
+  readonly events: BackgroundExecOutputEvent[];
+  readonly nextCursor: string;
+  readonly state: string;
+  readonly exitCode: number | undefined;
+  readonly reason: string;
+  readonly idleDeadlineAt: string | undefined;
+
+  constructor(fields: {
+    events?: BackgroundExecOutputEvent[];
+    nextCursor?: string;
+    state?: string;
+    exitCode?: number;
+    reason?: string;
+    idleDeadlineAt?: string;
+  }) {
+    this.events = fields.events ?? [];
+    this.nextCursor = fields.nextCursor ?? "";
+    this.state = fields.state ?? "";
+    this.exitCode = fields.exitCode;
+    this.reason = fields.reason ?? "";
+    this.idleDeadlineAt = fields.idleDeadlineAt;
+  }
+
+  async writeOutput(writers: ExecOutputWriters = {}): Promise<void> {
+    await writeBackgroundExecOutput(this.events, writers.stdout, writers.stderr, writers.stderr);
+  }
+
+  async writeMergedOutput(output?: ExecOutputWriter, notices?: ExecOutputWriter): Promise<void> {
+    await writeBackgroundExecOutput(this.events, output, output, notices);
+  }
+
+  terminalResult(): ExecTerminalResult | undefined {
+    for (let i = this.events.length - 1; i >= 0; i -= 1) {
+      const event = this.events[i];
+      switch (event.type) {
+        case "exit":
+          return { status: "exited", exitCode: event.exitCode };
+        case "cancelled":
+          return { status: "cancelled", reason: event.reason };
+        case "error":
+          return { status: "error", reason: event.reason };
+      }
+    }
+    return terminalResultFromExecState(this.state, this.exitCode, this.reason);
+  }
+}
+
+export class BackgroundExecFollower {
+  private cursorValue = "";
+
+  constructor(
+    private readonly client: Run9Client,
+    private readonly execID: string
+  ) {}
+
+  cursor(): string {
+    return this.cursorValue;
+  }
+
+  setCursor(cursor: string): void {
+    this.cursorValue = cursor.trim();
+  }
+
+  reset(): void {
+    this.setCursor("");
+  }
+
+  async read(wait = 0, options: { signal?: AbortSignal } = {}): Promise<BackgroundExecPullOutput> {
+    const deadline = wait > 0 ? Date.now() + wait : 0;
+    let requestCursor = this.cursorValue;
+    while (true) {
+      const requestWait = deadline > 0 ? Math.max(0, deadline - Date.now()) : wait;
+      const result = await this.client.pullBackgroundExecOutput(
+        this.execID,
+        {
+          cursor: requestCursor,
+          wait: requestWait
+        },
+        options
+      );
+      this.cursorValue = result.nextCursor.trim();
+      if (!shouldContinueBackgroundExecRead(result, requestCursor, deadline)) {
+        return result;
+      }
+      requestCursor = this.cursorValue;
+    }
+  }
+
+  async pump(wait = 0, writers: ExecOutputWriters = {}, options: { signal?: AbortSignal } = {}): Promise<BackgroundExecPullOutput> {
+    const result = await this.read(wait, options);
+    await result.writeOutput(writers);
+    return result;
   }
 }
 
@@ -420,6 +528,47 @@ export class Run9Client {
     return new ExecStream(response.headers.get("X-Run9-Exec-ID")?.trim() ?? "", response.body);
   }
 
+  async runExec(
+    boxID: string,
+    req: ExecRequest,
+    writers: ExecOutputWriters = {},
+    options: { signal?: AbortSignal } = {}
+  ): Promise<ExecTerminalResult> {
+    const stream = await this.startExecStream(boxID, req, options);
+    return stream.pump(writers, options);
+  }
+
+  async runExecCapture(boxID: string, req: ExecRequest, options: { signal?: AbortSignal } = {}): Promise<ExecCapture> {
+    const stream = await this.startExecStream(boxID, req, options);
+    let execID = stream.execID.trim();
+    try {
+      while (true) {
+        let event: ExecStreamEvent;
+        try {
+          event = await stream.readEvent();
+        } catch (error) {
+          if (!execID) {
+            throw new Error("foreground exec stream missing exec id");
+          }
+          return await this.recoverExecCapture(execID, error);
+        }
+        if (!execID) {
+          execID = event.exec_id?.trim() ?? "";
+        }
+        const terminal = terminalResultFromExecEvent(event);
+        if (!terminal) {
+          continue;
+        }
+        if (!execID) {
+          throw new Error("foreground exec stream missing exec id");
+        }
+        return await this.finishExecCapture(execID, terminal);
+      }
+    } finally {
+      await stream.close().catch(() => undefined);
+    }
+  }
+
   async listExecs(req: ListExecsRequest = {}, options: { signal?: AbortSignal } = {}): Promise<ListExecsResult> {
     const response = await this.rawRequest("GET", this.workspacePath("/execs"), {
       query: {
@@ -464,14 +613,18 @@ export class Run9Client {
     });
     const body = new Uint8Array(await response.arrayBuffer());
     const rawExitCode = response.headers.get("X-Run9-Exit-Code")?.trim();
-    return {
-      body,
+    return new BackgroundExecPullOutput({
+      events: decodeBackgroundExecOutputEvents(body),
       nextCursor: response.headers.get("X-Run9-Next-Cursor")?.trim() ?? "",
       state: response.headers.get("X-Run9-Exec-State")?.trim() ?? "",
       exitCode: rawExitCode ? parseStrictInteger(rawExitCode, "X-Run9-Exit-Code") : undefined,
       reason: response.headers.get("X-Run9-Reason")?.trim() ?? "",
       idleDeadlineAt: parseOptionalHeaderDate(response.headers, "X-Run9-Idle-Deadline-At")
-    };
+    });
+  }
+
+  followBackgroundExec(execID: string): BackgroundExecFollower {
+    return new BackgroundExecFollower(this, execID.trim());
   }
 
   async writeBackgroundExecStdin(
@@ -616,6 +769,51 @@ export class Run9Client {
     return attachSocket;
   }
 
+  private async recoverExecCapture(execID: string, streamError: unknown): Promise<ExecCapture> {
+    try {
+      const view = await this.waitExecTerminal(execID);
+      const terminal = terminalResultFromExecView(view);
+      if (!terminal) {
+        throw new Error(`foreground exec ${execID} never reached a terminal result`);
+      }
+      return await this.finishExecCapture(execID, terminal);
+    } catch (error) {
+      throw new Error(`recover foreground exec ${execID} after stream failure: ${asError(error).message}`, {
+        cause: streamError
+      });
+    }
+  }
+
+  private async waitExecTerminal(execID: string): Promise<ExecView> {
+    const deadline = Date.now() + foregroundExecRecoveryTimeout;
+    while (true) {
+      const view = await this.getExec(execID);
+      if (terminalResultFromExecView(view)) {
+        return view;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(`foreground exec ${execID} did not reach terminal state before recovery timeout`);
+      }
+      await delay(Math.min(foregroundExecRecoveryPollInterval, remaining));
+    }
+  }
+
+  private async finishExecCapture(execID: string, terminal: ExecTerminalResult): Promise<ExecCapture> {
+    const result: ExecCapture = { execID, terminal };
+    try {
+      result.transcript = await readStreamToUint8Array(await this.downloadExecLog(execID));
+    } catch (error) {
+      const reason = execLogDownloadUnavailableReason(error);
+      if (reason) {
+        result.transcriptUnavailableReason = reason;
+        return result;
+      }
+      throw error;
+    }
+    return result;
+  }
+
   private async request<T>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
     const response = await this.rawRequest(method, path, options);
     return decodeJSON<T>(response);
@@ -740,6 +938,284 @@ async function readIncomingMessageText(response: IncomingMessage): Promise<strin
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
   return Buffer.concat(chunks).toString("utf8");
+}
+
+const foregroundExecRecoveryPollInterval = 2_000;
+const foregroundExecRecoveryTimeout = 5_000;
+const foregroundExecLogUnavailableReason = "foreground exec log archive is not available";
+const execOutputUnavailableReason = "exec output is no longer available";
+
+const backgroundExecFrameHeaderSize = 13;
+const backgroundExecFrameStarted = 1;
+const backgroundExecFrameStdout = 2;
+const backgroundExecFrameStderr = 3;
+const backgroundExecFrameGap = 4;
+const backgroundExecFrameTruncated = 5;
+const backgroundExecFrameExit = 6;
+const backgroundExecFrameCancelled = 7;
+const backgroundExecFrameError = 8;
+
+const backgroundExecGapNoticePrefix = "[run9] background exec omitted ";
+const backgroundExecGapNoticeSuffix = " bytes around this cursor\n";
+const backgroundExecTruncatedMessage = "[run9] background exec output was truncated at the service limit\n";
+
+interface ExecEventReader {
+  readEvent(): Promise<ExecStreamEvent>;
+  close(): void | Promise<void>;
+}
+
+async function pumpExecEvents(
+  reader: ExecEventReader,
+  writers: ExecOutputWriters,
+  options: { signal?: AbortSignal }
+): Promise<ExecTerminalResult> {
+  const abort = () => {
+    void Promise.resolve(reader.close()).catch(() => undefined);
+  };
+  if (options.signal?.aborted) {
+    abort();
+    throw abortError(options.signal);
+  }
+  options.signal?.addEventListener("abort", abort, { once: true });
+  try {
+    while (true) {
+      const event = await reader.readEvent();
+      switch (event.type) {
+        case "keepalive":
+        case "started":
+          continue;
+        case "stdout":
+          await writeOutput(writers.stdout, event.data ?? new Uint8Array());
+          continue;
+        case "stderr":
+          await writeOutput(writers.stderr, event.data ?? new Uint8Array());
+          continue;
+        case "exit":
+          return { status: "exited", exitCode: event.exit_code ?? 0 };
+        case "cancelled":
+          return { status: "cancelled", reason: event.cancel_reason };
+        case "error":
+          return { status: "error", reason: event.failure_reason };
+      }
+    }
+  } catch (error) {
+    if (options.signal?.aborted) {
+      throw abortError(options.signal);
+    }
+    throw error;
+  } finally {
+    options.signal?.removeEventListener("abort", abort);
+    await Promise.resolve(reader.close()).catch(() => undefined);
+  }
+}
+
+async function writeBackgroundExecOutput(
+  events: BackgroundExecOutputEvent[],
+  stdout?: ExecOutputWriter,
+  stderr?: ExecOutputWriter,
+  notices?: ExecOutputWriter
+): Promise<void> {
+  for (const event of events) {
+    switch (event.type) {
+      case "started":
+        break;
+      case "stdout":
+        await writeOutput(stdout, event.data ?? new Uint8Array());
+        break;
+      case "stderr":
+        await writeOutput(stderr, event.data ?? new Uint8Array());
+        break;
+      case "gap":
+        await writeOutput(notices, Buffer.from(`${backgroundExecGapNoticePrefix}${event.gapBytes ?? 0}${backgroundExecGapNoticeSuffix}`));
+        break;
+      case "truncated":
+        await writeOutput(notices, Buffer.from(backgroundExecTruncatedMessage));
+        break;
+    }
+  }
+}
+
+async function writeOutput(writer: ExecOutputWriter | undefined, chunk: Uint8Array): Promise<void> {
+  if (!writer) {
+    return;
+  }
+  if (typeof writer === "function") {
+    await writer(chunk);
+    return;
+  }
+  if (isWebWritableStream(writer)) {
+    const streamWriter = writer.getWriter();
+    try {
+      await streamWriter.write(chunk);
+    } finally {
+      streamWriter.releaseLock();
+    }
+    return;
+  }
+  await writer.write(chunk);
+}
+
+function isWebWritableStream(writer: Exclude<ExecOutputWriter, (chunk: Uint8Array) => void | Promise<void>>): writer is WritableStream<Uint8Array> {
+  return "getWriter" in writer && typeof writer.getWriter === "function";
+}
+
+function decodeBackgroundExecOutputEvents(body: Uint8Array): BackgroundExecOutputEvent[] {
+  const events: BackgroundExecOutputEvent[] = [];
+  let offset = 0;
+  while (offset < body.byteLength) {
+    if (body.byteLength - offset < backgroundExecFrameHeaderSize) {
+      throw new Error("truncated background exec frame header");
+    }
+    const view = new DataView(body.buffer, body.byteOffset + offset, backgroundExecFrameHeaderSize);
+    const frameType = view.getUint8(0);
+    const seq = safeUint64(view.getBigUint64(1), "background exec frame seq");
+    const payloadLength = view.getUint32(9);
+    offset += backgroundExecFrameHeaderSize;
+    if (body.byteLength - offset < payloadLength) {
+      throw new Error("truncated background exec frame payload");
+    }
+    const payload = body.slice(offset, offset + payloadLength);
+    offset += payloadLength;
+    events.push(decodeBackgroundExecOutputEvent(frameType, seq, payload));
+  }
+  return events;
+}
+
+function decodeBackgroundExecOutputEvent(frameType: number, seq: number, payload: Uint8Array): BackgroundExecOutputEvent {
+  switch (frameType) {
+    case backgroundExecFrameStarted:
+      expectPayloadLength(payload, 0, "started frame");
+      return { seq, type: "started" };
+    case backgroundExecFrameStdout:
+      return { seq, type: "stdout", data: payload.slice() };
+    case backgroundExecFrameStderr:
+      return { seq, type: "stderr", data: payload.slice() };
+    case backgroundExecFrameGap:
+      expectPayloadLength(payload, 8, "gap frame");
+      return { seq, type: "gap", gapBytes: safeUint64(new DataView(payload.buffer, payload.byteOffset, 8).getBigUint64(0), "gap bytes") };
+    case backgroundExecFrameTruncated:
+      expectPayloadLength(payload, 0, "truncated frame");
+      return { seq, type: "truncated" };
+    case backgroundExecFrameExit:
+      expectPayloadLength(payload, 4, "exit frame");
+      return { seq, type: "exit", exitCode: new DataView(payload.buffer, payload.byteOffset, 4).getInt32(0) };
+    case backgroundExecFrameCancelled:
+      return { seq, type: "cancelled", reason: new TextDecoder().decode(payload) };
+    case backgroundExecFrameError:
+      return { seq, type: "error", reason: new TextDecoder().decode(payload) };
+    default:
+      throw new Error(`unsupported background exec frame type ${frameType}`);
+  }
+}
+
+function expectPayloadLength(payload: Uint8Array, expected: number, label: string): void {
+  if (payload.byteLength !== expected) {
+    throw new Error(`${label} expects ${expected === 0 ? "empty" : `${expected}-byte`} payload`);
+  }
+}
+
+function safeUint64(value: bigint, label: string): number {
+  if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`${label} exceeds Number.MAX_SAFE_INTEGER`);
+  }
+  return Number(value);
+}
+
+function terminalResultFromExecEvent(event: ExecStreamEvent): ExecTerminalResult | undefined {
+  switch (event.type) {
+    case "exit":
+      return { status: "exited", exitCode: event.exit_code ?? 0 };
+    case "cancelled":
+      return { status: "cancelled", reason: event.cancel_reason };
+    case "error":
+      return { status: "error", reason: event.failure_reason };
+    default:
+      return undefined;
+  }
+}
+
+function terminalResultFromExecView(view: ExecView): ExecTerminalResult | undefined {
+  return terminalResultFromExecState(view.state, view.exit_code ?? undefined, view.reason);
+}
+
+function terminalResultFromExecState(state: string, exitCode?: number, reason?: string): ExecTerminalResult | undefined {
+  switch (state.trim()) {
+    case "succeeded":
+      return { status: "exited", exitCode: exitCode ?? 0 };
+    case "failed":
+      return exitCode === undefined ? (reason?.trim() ? { status: "error", reason } : undefined) : { status: "exited", exitCode };
+    case "cancelled":
+      return { status: "cancelled", reason };
+    case "error":
+      return { status: "error", exitCode, reason };
+    default:
+      return undefined;
+  }
+}
+
+function shouldContinueBackgroundExecRead(result: BackgroundExecPullOutput, requestCursor: string, deadline: number): boolean {
+  if (result.terminalResult()) {
+    return false;
+  }
+  if (deadline === 0 || Date.now() >= deadline - 1) {
+    return false;
+  }
+  if (!["pending", "running"].includes(result.state.trim())) {
+    return false;
+  }
+  if (!result.nextCursor.trim()) {
+    return false;
+  }
+  if (result.events.length === 0) {
+    return true;
+  }
+  return result.events.every((event) => event.type === "started") && result.nextCursor.trim() !== requestCursor.trim();
+}
+
+async function readStreamToUint8Array(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+
+function execLogDownloadUnavailableReason(error: unknown): string | undefined {
+  if (!(error instanceof Run9Error)) {
+    return undefined;
+  }
+  switch (error.message.trim()) {
+    case foregroundExecLogUnavailableReason:
+    case execOutputUnavailableReason:
+      return error.message.trim();
+    default:
+      return undefined;
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("operation aborted");
 }
 
 function decodeExecStreamEvent(raw: string): ExecStreamEvent {

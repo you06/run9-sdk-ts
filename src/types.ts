@@ -286,6 +286,24 @@ export interface ExecView {
   diagnostics?: Record<string, unknown>;
 }
 
+export type ExecTerminalStatus = "exited" | "cancelled" | "error";
+
+export interface ExecTerminalResult {
+  status: ExecTerminalStatus;
+  exitCode?: number;
+  reason?: string;
+}
+
+export type ExecOutputWriter =
+  | { write(chunk: Uint8Array): void | Promise<void> | boolean }
+  | WritableStream<Uint8Array>
+  | ((chunk: Uint8Array) => void | Promise<void>);
+
+export interface ExecOutputWriters {
+  stdout?: ExecOutputWriter;
+  stderr?: ExecOutputWriter;
+}
+
 export interface SharedSnapLineView {
   org_id: string;
   name: string;
@@ -473,6 +491,25 @@ export interface ExecStreamEvent {
   cancel_reason?: string;
 }
 
+export type BackgroundExecOutputEventType =
+  | "started"
+  | "stdout"
+  | "stderr"
+  | "gap"
+  | "truncated"
+  | "exit"
+  | "cancelled"
+  | "error";
+
+export interface BackgroundExecOutputEvent {
+  seq: number;
+  type: BackgroundExecOutputEventType;
+  data?: Uint8Array;
+  gapBytes?: number;
+  exitCode?: number;
+  reason?: string;
+}
+
 export interface ExecAttachInput {
   type: string;
   data?: string | Uint8Array;
@@ -507,11 +544,9 @@ export interface WriteBackgroundExecStdinRequest {
   closeStdin?: boolean;
 }
 
-export interface BackgroundExecPullOutput {
-  body: Uint8Array;
-  nextCursor: string;
-  state: string;
-  exitCode?: number;
-  reason: string;
-  idleDeadlineAt?: string;
+export interface ExecCapture {
+  execID: string;
+  terminal: ExecTerminalResult;
+  transcript?: Uint8Array;
+  transcriptUnavailableReason?: string;
 }
