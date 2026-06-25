@@ -550,7 +550,7 @@ export class Run9Client {
           if (!execID) {
             throw new Error("foreground exec stream missing exec id");
           }
-          return await this.recoverExecCapture(execID, error);
+          return await this.recoverExecCapture(execID, error, options);
         }
         if (!execID) {
           execID = event.exec_id?.trim() ?? "";
@@ -562,7 +562,7 @@ export class Run9Client {
         if (!execID) {
           throw new Error("foreground exec stream missing exec id");
         }
-        return await this.finishExecCapture(execID, terminal);
+        return await this.finishExecCapture(execID, terminal, options);
       }
     } finally {
       await stream.close().catch(() => undefined);
@@ -769,40 +769,40 @@ export class Run9Client {
     return attachSocket;
   }
 
-  private async recoverExecCapture(execID: string, streamError: unknown): Promise<ExecCapture> {
+  private async recoverExecCapture(execID: string, streamError: unknown, options: { signal?: AbortSignal }): Promise<ExecCapture> {
+    const recoverySignal = foregroundExecRecoverySignal(options.signal);
     try {
-      const view = await this.waitExecTerminal(execID);
+      const view = await this.waitExecTerminal(execID, { signal: recoverySignal });
       const terminal = terminalResultFromExecView(view);
       if (!terminal) {
         throw new Error(`foreground exec ${execID} never reached a terminal result`);
       }
-      return await this.finishExecCapture(execID, terminal);
+      return await this.finishExecCapture(execID, terminal, { signal: recoverySignal });
     } catch (error) {
       throw new Error(`recover foreground exec ${execID} after stream failure: ${asError(error).message}`, {
         cause: streamError
       });
+    } finally {
+      stopTimeoutSignal(recoverySignal);
     }
   }
 
-  private async waitExecTerminal(execID: string): Promise<ExecView> {
-    const deadline = Date.now() + foregroundExecRecoveryTimeout;
+  private async waitExecTerminal(execID: string, options: { signal?: AbortSignal }): Promise<ExecView> {
     while (true) {
-      const view = await this.getExec(execID);
+      throwIfAborted(options.signal);
+      const view = await this.getExec(execID, { signal: options.signal });
       if (terminalResultFromExecView(view)) {
         return view;
       }
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        throw new Error(`foreground exec ${execID} did not reach terminal state before recovery timeout`);
-      }
-      await delay(Math.min(foregroundExecRecoveryPollInterval, remaining));
+      await delay(foregroundExecRecoveryPollInterval, options.signal);
     }
   }
 
-  private async finishExecCapture(execID: string, terminal: ExecTerminalResult): Promise<ExecCapture> {
+  private async finishExecCapture(execID: string, terminal: ExecTerminalResult, options: { signal?: AbortSignal }): Promise<ExecCapture> {
     const result: ExecCapture = { execID, terminal };
+    const outputSignal = foregroundExecRecoverySignal(options.signal);
     try {
-      result.transcript = await readStreamToUint8Array(await this.downloadExecLog(execID));
+      result.transcript = await readStreamToUint8Array(await this.downloadExecLog(execID, { signal: outputSignal }), outputSignal);
     } catch (error) {
       const reason = execLogDownloadUnavailableReason(error);
       if (reason) {
@@ -810,6 +810,8 @@ export class Run9Client {
         return result;
       }
       throw error;
+    } finally {
+      stopTimeoutSignal(outputSignal);
     }
     return result;
   }
@@ -1172,12 +1174,17 @@ function shouldContinueBackgroundExecRead(result: BackgroundExecPullOutput, requ
   return result.events.every((event) => event.type === "started") && result.nextCursor.trim() !== requestCursor.trim();
 }
 
-async function readStreamToUint8Array(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+async function readStreamToUint8Array(stream: ReadableStream<Uint8Array>, signal?: AbortSignal): Promise<Uint8Array> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
+  const abort = () => {
+    void reader.cancel(signal ? abortError(signal) : new Error("operation aborted")).catch(() => undefined);
+  };
+  signal?.addEventListener("abort", abort, { once: true });
   try {
     while (true) {
+      throwIfAborted(signal);
       const { done, value } = await reader.read();
       if (done) {
         break;
@@ -1186,6 +1193,7 @@ async function readStreamToUint8Array(stream: ReadableStream<Uint8Array>): Promi
       total += value.byteLength;
     }
   } finally {
+    signal?.removeEventListener("abort", abort);
     reader.releaseLock();
   }
   const result = new Uint8Array(total);
@@ -1210,8 +1218,41 @@ function execLogDownloadUnavailableReason(error: unknown): string | undefined {
   }
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function foregroundExecRecoverySignal(parent?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(foregroundExecRecoveryTimeout);
+  if (!parent) {
+    return timeout;
+  }
+  return AbortSignal.any([parent, timeout]);
+}
+
+function stopTimeoutSignal(_signal: AbortSignal): void {
+  // AbortSignal.timeout cannot be cancelled; this hook keeps the call sites explicit.
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      cleanup();
+      reject(signal ? abortError(signal) : new Error("operation aborted"));
+    };
+    const cleanup = () => {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw abortError(signal);
+  }
 }
 
 function abortError(signal: AbortSignal): Error {

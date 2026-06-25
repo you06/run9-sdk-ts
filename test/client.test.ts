@@ -1,6 +1,6 @@
 import { once } from "node:events";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { WebSocketServer } from "ws";
 import {
   BackgroundExecPullOutput,
@@ -364,6 +364,68 @@ describe("Run9Client", () => {
     });
     expect(capture.terminal).toEqual({ status: "exited", exitCode: 0 });
     expect(Buffer.from(capture.transcript ?? new Uint8Array()).toString("utf8")).toBe("recovered transcript\n");
+  });
+
+  it("bounds foreground exec capture log-download waits", async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(AbortSignal.abort(new Error("recovery timeout")));
+    try {
+      const fetchImpl: typeof fetch = async (input, init) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/projects/default/workspace/boxes/box-1/execs/stream") {
+          return new Response(`${JSON.stringify({ type: "exit", exit_code: 0 })}\n`, {
+            headers: { "X-Run9-Exec-ID": "exec-stream-1" }
+          });
+        }
+        expect(url.pathname).toBe("/projects/default/workspace/execs/exec-stream-1/log-download");
+        if (init?.signal?.aborted) {
+          throw init.signal.reason;
+        }
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason ?? new Error("aborted")), { once: true });
+        });
+      };
+      const capture = new Run9Client("http://run9.local", creds, { fetch: fetchImpl })
+        .withProject("default")
+        .runExecCapture("box-1", { command: ["echo", "hi"] });
+
+      await expect(capture).rejects.toThrow("recovery timeout");
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
+  it("bounds foreground exec capture getExec recovery polling", async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(AbortSignal.abort(new Error("recovery timeout")));
+    try {
+      const fetchImpl: typeof fetch = async (input, init) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/projects/default/workspace/boxes/box-1/execs/stream") {
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(Buffer.from(`${JSON.stringify({ type: "stdout", data: Buffer.from("live\n").toString("base64") })}\n`));
+              controller.error(new Error("stream transport lost"));
+            }
+          });
+          return new Response(body, {
+            headers: { "X-Run9-Exec-ID": "exec-stream-1" }
+          });
+        }
+        expect(url.pathname).toBe("/projects/default/workspace/execs/exec-stream-1");
+        if (init?.signal?.aborted) {
+          throw init.signal.reason;
+        }
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason ?? new Error("aborted")), { once: true });
+        });
+      };
+      const capture = new Run9Client("http://run9.local", creds, { fetch: fetchImpl })
+        .withProject("default")
+        .runExecCapture("box-1", { command: ["echo", "hi"] });
+
+      await expect(capture).rejects.toThrow(/recover foreground exec exec-stream-1 after stream failure: recovery timeout/);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
   });
 
   it("follows background exec output and skips started-only polls", async () => {
